@@ -3762,7 +3762,8 @@ fn normal_mode(cx: &mut Context) {
 }
 
 // Store a jump on the jumplist.
-fn push_jump(view: &mut View, doc: &Document) {
+fn push_jump(view: &mut View, doc: &mut Document) {
+    doc.append_changes_to_history(view);
     let jump = (doc.id(), doc.selection(view.id).clone());
     view.jumps.push(jump);
 }
@@ -4205,6 +4206,7 @@ pub mod insert {
             None
         };
 
+        let mut last_pos = 0;
         let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
             // Tracks the number of trailing whitespace characters deleted by this selection.
             let mut chars_deleted = 0;
@@ -4226,7 +4228,8 @@ pub mod insert {
             let (from, to, local_offs) = if let Some(idx) =
                 text.slice(line_start..pos).last_non_whitespace_char()
             {
-                let first_trailing_whitespace_char = (line_start + idx + 1).min(pos);
+                let first_trailing_whitespace_char = (line_start + idx + 1).clamp(last_pos, pos);
+                last_pos = pos;
                 let line = text.line(current_line);
 
                 let indent = match line.first_non_whitespace_char() {
