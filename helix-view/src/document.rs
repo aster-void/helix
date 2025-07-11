@@ -1000,6 +1000,7 @@ impl Document {
         // mark changes up to now as saved
         let current_rev = self.get_current_revision();
         let doc_id = self.id();
+        let atomic_save = self.config.load().atomic_save;
 
         let encoding_with_bom_info = (self.encoding, self.has_bom);
         let last_saved_time = self.last_saved_time;
@@ -1228,7 +1229,7 @@ impl Document {
         }
     }
 
-    pub(crate) fn detect_editor_config(&mut self) {
+    pub fn detect_editor_config(&mut self) {
         if self.config.load().editor_config {
             if let Some(path) = self.path.as_ref() {
                 self.editor_config = EditorConfig::find(path);

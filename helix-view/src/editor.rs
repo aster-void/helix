@@ -15,7 +15,6 @@ use crate::{
     tree::{self, Tree},
     Document, DocumentId, View, ViewId,
 };
-use dap::StackFrame;
 use helix_event::dispatch;
 use helix_vcs::DiffProviderRegistry;
 
@@ -30,7 +29,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{self, stdin},
-    num::NonZeroUsize,
+    num::{NonZeroU8, NonZeroUsize},
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -53,7 +52,7 @@ use helix_core::{
     },
     Change, LineEnding, Position, Range, Selection, Uri, NATIVE_LINE_ENDING,
 };
-use helix_dap as dap;
+use helix_dap::{self as dap, registry::DebugAdapterId};
 use helix_lsp::lsp;
 use helix_stdx::path::canonicalize;
 
@@ -347,6 +346,10 @@ pub struct Config {
     pub default_line_ending: LineEndingConfig,
     /// Whether to automatically insert a trailing line-ending on write if missing. Defaults to `true`.
     pub insert_final_newline: bool,
+    /// Whether to use atomic operations to write documents to disk.
+    /// This prevents data loss if the editor is interrupted while writing the file, but may
+    /// confuse some file watching/hot reloading programs. Defaults to `true`.
+    pub atomic_save: bool,
     /// Whether to automatically remove all trailing line-endings after the final one on write.
     /// Defaults to `false`.
     pub trim_final_newlines: bool,
@@ -461,6 +464,9 @@ pub struct LspConfig {
     pub display_signature_help_docs: bool,
     /// Display inlay hints
     pub display_inlay_hints: bool,
+    /// Maximum displayed length of inlay hints (excluding the added trailing `…`).
+    /// If it's `None`, there's no limit
+    pub inlay_hints_length_limit: Option<NonZeroU8>,
     /// Display document color swatches
     pub display_color_swatches: bool,
     /// Whether to enable snippet support
@@ -478,6 +484,7 @@ impl Default for LspConfig {
             auto_signature_help: true,
             display_signature_help_docs: true,
             display_inlay_hints: false,
+            inlay_hints_length_limit: None,
             snippets: true,
             goto_reference_include_declaration: true,
             display_color_swatches: true,
@@ -1019,6 +1026,7 @@ impl Default for Config {
             workspace_lsp_roots: Vec::new(),
             default_line_ending: LineEndingConfig::default(),
             insert_final_newline: true,
+            atomic_save: true,
             trim_final_newlines: false,
             trim_trailing_whitespace: false,
             smart_tab: Some(SmartTabConfig::default()),
@@ -1082,8 +1090,7 @@ pub struct Editor {
     pub diagnostics: Diagnostics,
     pub diff_providers: DiffProviderRegistry,
 
-    pub debugger: Option<dap::Client>,
-    pub debugger_events: SelectAll<UnboundedReceiverStream<dap::Payload>>,
+    pub debug_adapters: dap::registry::Registry,
     pub breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
 
     pub syn_loader: Arc<ArcSwap<syntax::Loader>>,
@@ -1141,7 +1148,7 @@ pub enum EditorEvent {
     DocumentSaved(DocumentSavedEventResult),
     ConfigEvent(ConfigEvent),
     LanguageServerMessage((LanguageServerId, Call)),
-    DebuggerEvent(dap::Payload),
+    DebuggerEvent((DebugAdapterId, dap::Payload)),
     IdleTimer,
     Redraw,
 }
@@ -1228,8 +1235,7 @@ impl Editor {
             language_servers,
             diagnostics: Diagnostics::new(),
             diff_providers: DiffProviderRegistry::default(),
-            debugger: None,
-            debugger_events: SelectAll::new(),
+            debug_adapters: dap::registry::Registry::new(),
             breakpoints: HashMap::new(),
             syn_loader,
             theme_loader,
@@ -1291,11 +1297,16 @@ impl Editor {
 
     /// Call if the config has changed to let the editor update all
     /// relevant members.
-    pub fn refresh_config(&mut self) {
+    pub fn refresh_config(&mut self, old_config: &Config) {
         let config = self.config();
         self.auto_pairs = (&config.auto_pairs).into();
         self.reset_idle_timer();
         self._refresh();
+        helix_event::dispatch(crate::events::ConfigDidChange {
+            editor: self,
+            old: old_config,
+            new: &config,
+        })
     }
 
     pub fn clear_idle_timer(&mut self) {
@@ -1436,7 +1447,11 @@ impl Editor {
                 log::error!("failed to apply workspace edit: {err:?}")
             }
         }
-        fs::rename(old_path, &new_path)?;
+
+        if old_path.exists() {
+            fs::rename(old_path, &new_path)?;
+        }
+
         if let Some(doc) = self.document_by_path(old_path) {
             self.set_doc_path(doc.id(), &new_path);
         }
@@ -2149,7 +2164,7 @@ impl Editor {
                 Some(message) = self.language_servers.incoming.next() => {
                     return EditorEvent::LanguageServerMessage(message)
                 }
-                Some(event) = self.debugger_events.next() => {
+                Some(event) = self.debug_adapters.incoming.next() => {
                     return EditorEvent::DebuggerEvent(event)
                 }
 
@@ -2225,10 +2240,8 @@ impl Editor {
         }
     }
 
-    pub fn current_stack_frame(&self) -> Option<&StackFrame> {
-        self.debugger
-            .as_ref()
-            .and_then(|debugger| debugger.current_stack_frame())
+    pub fn current_stack_frame(&self) -> Option<&dap::StackFrame> {
+        self.debug_adapters.current_stack_frame()
     }
 
     /// Returns the id of a view that this doc contains a selection for,
